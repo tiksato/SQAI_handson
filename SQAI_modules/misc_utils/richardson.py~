@@ -1,0 +1,167 @@
+import numpy as np
+from scipy.optimize import root
+from scipy.integrate import solve_ivp
+
+def richardson_residuals(x, eps, G):
+    """ Residuals of the standard Richardson equations (separated into real and imaginary parts). """
+    M = len(x) // 2
+    E = x[:M] + 1j * x[M:]
+    res = np.zeros(M, dtype=complex)
+    for a in range(M):
+        sum_p = np.sum(1.0 / (2.0 * eps - E[a]))
+        sum_b = np.sum([2.0 / (E[a] - E[b]) for b in range(M) if b != a])
+        res[a] = 1.0 / G - sum_p - sum_b
+    return np.concatenate([res.real, res.imag])
+
+def richardson_ode_system(t, y, eps, G_start, G_target, bump):
+    """
+    Defines the differential equations dE/dt for the Richardson equations.
+    G is varied using the parameter t (from 0 to 1), smoothly bypassing singularities via the complex plane.
+    """
+    M = len(y) // 2
+    E = y[:M] + 1j * y[M:]
+    
+    # Define the path G(t): draw an arch (bump) in the complex plane to avoid singularities on the real axis
+    G = G_start + t * (G_target - G_start) + 1j * bump * np.sin(np.pi * t)
+    dG_dt = (G_target - G_start) + 1j * bump * np.pi * np.cos(np.pi * t)
+    
+    # Construct the Jacobian matrix J
+    J = np.zeros((M, M), dtype=complex)
+    for a in range(M):
+        sum_p = np.sum(1.0 / (2.0 * eps - E[a])**2)
+        sum_b = 0.0
+        for b in range(M):
+            if b != a:
+                term = 2.0 / (E[a] - E[b])**2
+                sum_b += term
+                J[a, b] = term
+        J[a, a] = sum_p - sum_b
+        
+    # Differential equation: J * (dE/dG) = -1/G^2
+    vec = -np.ones(M, dtype=complex) / (G**2)
+    dE_dG = np.linalg.solve(J, vec)
+    
+    # Chain rule: dE/dt = (dE/dG) * (dG/dt)
+    dE_dt = dE_dG * dG_dt
+    
+    return np.concatenate([dE_dt.real, dE_dt.imag])
+
+def solve_richardson_ode(N_orb=10, M=5, G_target=0.5):
+    eps = np.arange(1, N_orb + 1, dtype=float)
+    G_start = 1e-4  # Start from a tiny G where perturbation theory holds accurately
+    
+    print(f"--- ODE Continuation Method (N_orb={N_orb}, M={M}, G_target={G_target:.4f}) ---")
+    
+    # 1. Rigorous determination of initial values (at G_start)
+    E_init = 2.0 * eps[:M] - G_start
+    x_init = np.concatenate([E_init, np.zeros(M)])
+    res_init = root(richardson_residuals, x_init, args=(eps, G_start), method='lm', tol=1e-13)
+    y0 = res_init.x
+    
+    # 2. Solve the ordinary differential equation (ODE) to continuously track roots up to G_target
+    print("Integrating ODE along a complex contour to perfectly track the ground state...")
+    #bump = 0.2  # Height of the detour into the complex plane
+    #sol = solve_ivp(richardson_ode_system, [0.0, 1.0], y0, 
+    #                args=(eps, G_start, G_target, bump),
+    #                method='RK45', rtol=1e-11, atol=1e-13)
+
+    print("Use Radau propagator.")
+    bump = 0.02  # Height of the detour into the complex plane
+    sol = solve_ivp(richardson_ode_system, [0.0, 1.0], y0, 
+                    args=(eps, G_start, G_target, bump),
+                    method='Radau', rtol=1e-5, atol=1e-7)
+
+    y_final = sol.y[:, -1]
+    
+    # 3. Final high-precision polishing
+    print("Performing final high-precision polishing at G_target...")
+    res_final = root(richardson_residuals, y_final, args=(eps, G_target), method='lm', tol=1e-14)
+    
+    E_opt = res_final.x[:M] + 1j * res_final.x[M:]
+    total_energy = np.sum(E_opt).real
+    
+    return E_opt, total_energy
+
+import numpy as np
+from scipy.optimize import root
+from scipy.integrate import solve_ivp
+
+# (richardson_residuals と richardson_ode_system は前回のままでOKです)
+
+def richardson_G_sweep(N_orb, M, G_list, bump=0.01, verbose=0):
+    """
+    Perform a sequential G-sweep using the continuation method.
+    Uses the exact roots from the previous G as the starting point for the next G.
+    """
+    eps = np.arange(1, N_orb + 1, dtype=float)
+    
+    # 1. Initialize at the perturbative limit (G = 1e-5)
+    G_current = 1e-5
+    E_init = 2.0 * eps[:M] - G_current
+    x_init = np.concatenate([E_init, np.zeros(M)])
+    res_init = root(richardson_residuals, x_init, args=(eps, G_current), method='lm', tol=1e-13)
+    y_current = res_init.x
+    
+    sweep_results = []
+    
+    print(f"--- Starting Sequential G-Sweep (N_orb={N_orb}, M={M}) ---")
+    
+    for G_target in G_list:
+        # If the step is very small, we might be able to skip ODE, 
+        # but using a fast ODE step guarantees topological safety.
+        
+        # Integrate ODE from G_current to G_target
+        sol = solve_ivp(richardson_ode_system, [0.0, 1.0], y_current, 
+                        args=(eps, G_current, G_target, bump),
+                        method='Radau', rtol=1e-5, atol=1e-7)
+        
+        y_guess = sol.y[:, -1]
+        
+        # Polish at G_target
+        res_final = root(richardson_residuals, y_guess, args=(eps, G_target), method='lm', tol=1e-14)
+        y_current = res_final.x  # Update the current roots for the NEXT iteration!
+        G_current = G_target     # Update the current G
+        
+        # Calculate Energy
+        E_opt = y_current[:M] + 1j * y_current[M:]
+        total_energy = np.sum(E_opt).real
+        sweep_results.append(total_energy)
+
+        if verbose > 0:
+            print(f"Tracking: G = {G_current:.4f} -> {G_target:.4f} ... ", end="")
+            print(f"Energy = {total_energy:.10f}")
+        
+    return sweep_results
+
+def test_richardson_sweep():
+    '''
+    Example:
+    N_orb=30, M=15
+    G=0.1 to 0.5 with 0.05 increments
+    '''
+    G_points = np.linspace(0.1, 0.5, 9)
+    energies = richardson_G_sweep(N_orb=30, M=15, G_list=G_points, bump=0.01)
+
+def test_richardson_solve():
+    '''
+    Example:
+    N_orb=20, M=10, G=0.5
+    '''
+    E_alpha, E_exact = solve_richardson_ode(N_orb=20, M=10, G_target=0.5)
+    
+    print("\n================================================")
+    print("             COMPLEX ROOTS REPORT               ")
+    print("================================================")
+    print(f"Richardson Exact Energy : {E_exact:.14f}")
+    print("================================================")
+    
+    print("\n[True Richardson Roots (Sorted by Real part)]")
+    sorted_indices = np.argsort(E_alpha.real)
+    for idx, a in enumerate(sorted_indices):
+        e = E_alpha[a]
+        if abs(e.imag) < 1e-8:
+            print(f"  Root {idx+1:02d} : {e.real:14.10f} (Purely Real)")
+        else:
+            print(f"  Root {idx+1:02d} : {e.real:14.10f} + {e.imag:14.10f}i")
+
+    

@@ -1,0 +1,621 @@
+import time
+import math
+import numpy as np
+from scipy.linalg import expm
+from pyscf import ci, cc, scf, mcscf, ao2mo, fci, lib
+
+
+
+def get_core(ncore, int1e, int2e):
+    cfock = (
+        int1e
+        + 2 * np.einsum("pjqj->pq", int2e[:, :ncore, :, :ncore])
+        - np.einsum("pjjq->pq", int2e[:, :ncore, :ncore, :])
+    )
+
+    Ecore = np.sum(np.diag(int1e[:ncore, :ncore] + cfock[:ncore, :ncore]))
+
+    int1a = cfock[ncore:, ncore:]
+    int2a = int2e[ncore:, ncore:, ncore:, ncore:]
+    return (Ecore, int1a, int2a)
+
+
+def get_core_uhf(ncore, int1e, int2e):
+    cfock = np.asarray(
+        [
+            int1e[0]
+            + np.einsum("pjqj->pq", int2e[0][:, :ncore, :, :ncore])
+            + np.einsum("pjqj->pq", int2e[2][:, :ncore, :, :ncore])
+            - np.einsum("pjjq->pq", int2e[0][:, :ncore, :ncore, :]),
+            int1e[1]
+            + np.einsum("pjqj->pq", int2e[1][:, :ncore, :, :ncore])
+            + np.einsum("jpjq->pq", int2e[2][:ncore, :, :ncore, :])
+            - np.einsum("pjjq->pq", int2e[1][:, :ncore, :ncore, :]),
+        ]
+    )
+
+    Ecore = (
+        np.sum(
+            np.diag(int1e[0][:ncore, :ncore] + cfock[0][:ncore, :ncore])
+            + np.diag(int1e[1][:ncore, :ncore] + cfock[1][:ncore, :ncore])
+        )
+        * 0.5
+    )
+
+    int1a = cfock[:, ncore:, ncore:]
+    int2a = int2e[:, ncore:, ncore:, ncore:, ncore:]
+    return (Ecore, int1a, int2a)
+
+
+class pyscf_RCCSD(cc.ccsd.CCSD):
+    def update_amps(self, t1, t2, eris):
+        t1, t2 = super().update_amps(t1, t2, eris)
+        return (t1, t2)
+
+
+class pyscf_UCCSD(cc.uccsd.UCCSD):
+    def update_amps(self, t1, t2, eris):
+        t1, t2 = super().update_amps(t1, t2, eris)
+        return ((t1[0], t1[1]), t2)
+
+
+class pyscf_RCCD(cc.ccsd.CCSD):
+    def update_amps(self, t1, t2, eris):
+        t1, t2 = super().update_amps(t1, t2, eris)
+        return (0 * t1, t2)
+
+
+class pyscf_UCCD(cc.uccsd.UCCSD):
+    def update_amps(self, t1, t2, eris):
+        t1, t2 = super().update_amps(t1, t2, eris)
+        return ((t1[0] * 0, t1[1] * 0), t2)
+
+
+class gaussian_basis:
+    def __init__(self, E_nuc, S, T, V1, V2, cmo, n_core, K_info=None, reorder=None):
+        if reorder is not None:
+            self.cmo = cmo.copy()[:, reorder]
+        else:
+            self.cmo = cmo.copy()
+
+        self.E_nuc = E_nuc
+        self.n_ao = self.cmo.shape[0]
+        self.n_mo = self.cmo.shape[1]
+        self.n_core = n_core
+        self.n_act = self.n_mo - self.n_core
+        if K_info is not None:
+            self.K_info = K_info.copy()
+            self.num_K = len(self.K_info)
+        else:
+            self.K_info = None
+            self.num_K = 0
+
+        H1 = T + V1
+
+        self.S = S
+        self.T = S
+        self.V1 = V1
+        self.ERIS = V2
+
+        self.h1mo = self.cmo.T @ (H1 @ self.cmo)
+        pqkl = np.einsum(
+            "pqrl,rk->pqkl",
+            np.einsum("pqrs,sl->pqrl", V2, self.cmo, optimize=True),
+            self.cmo,
+            optimize=True,
+        )
+        ijkl = np.einsum(
+            "pjkl,pi->ijkl",
+            np.einsum("pqkl,qj->pjkl", pqkl, self.cmo, optimize=True),
+            self.cmo,
+            optimize=True,
+        )
+        self.h2mo = ijkl.transpose(0, 2, 1, 3)  # <-- Physisists' order
+
+        self.E_core, self.h1mo, self.h2mo = get_core(self.n_core, self.h1mo, self.h2mo)
+
+        #####
+        self.h1opt = self.h1mo.copy()
+        self.h2opt = self.h2mo.copy()
+
+    def get_U_from_K(self, Kvec):
+        Kmat = np.zeros_like(self.h1mo)
+        for i_k, info in enumerate(self.K_info):
+            Kval = Kvec[i_k]
+            for (i, j), scale in info:
+                Kmat[i, j] = -np.conj(scale * Kval)
+                Kmat[j, i] = scale * Kval
+        Umat = expm(Kmat)
+        return Umat
+
+    def initialize_integrals(self):
+        self.h1opt = self.h1mo.copy()
+        self.h2opt = self.h2mo.copy()
+
+    def get_integrals(self, U=None):
+        if U is None:
+            U = np.eye(self.h1mo.shape[0])
+        return self.transform_integrals(self.h1mo, self.h2mo, U)
+
+    def update_integrals(self, U):
+        int1e, int2e = self.transform_integrals(self.h1opt, self.h2opt, U)
+        self.h1opt = int1e.copy()
+        self.h2opt = int2e.copy()
+
+    def transform_integrals(self, int1e_input, int2e_input, U):
+        int1e = np.conj(U.T) @ int1e_input @ U
+        cU = np.conj(U)
+        int2e = np.einsum("pqrs,sl->pqrl", int2e_input, U, optimize=True)
+        int2e = np.einsum("pqrl,rk->pqkl", int2e, U, optimize=True)
+        int2e = np.einsum("pqkl,qj->pjkl", int2e, cU, optimize=True)
+        int2e = np.einsum("pjkl,pi->ijkl", int2e, cU, optimize=True)
+        return (int1e, int2e)
+
+    def gfock_virtual(self, U, D1, D2, small=1e-10):
+        h1U = self.h1mo @ U
+        cU = np.conj(U)
+        h2U = np.einsum("pqrs,sl->pqrl", self.h2mo, U, optimize=True)
+        h2U = np.einsum("pqrl,rk->pqkl", h2U, U, optimize=True)
+        h2U = np.einsum("pqkl,qj->pjkl", h2U, cU, optimize=True)
+        h2U = np.einsum("pjkl,klij->pi", h2U, D2, optimize=True)
+
+        # invD1 = np.linalg.inv(D1)
+        De, Dv = np.linalg.eigh(D1)
+        iDe = np.diag(De / (De**2 + small))
+        invD1 = Dv @ (iDe @ np.conj(Dv.T))
+        h2U = h2U @ invD1
+
+        hU = h1U + h2U
+        hU -= U @ (np.conj(U.T) @ hU)
+        return hU
+
+
+class gaussian_basis_from_file(gaussian_basis):
+    def __init__(self, fname, n_core, K_info=None, reorder=None):
+        basis_data = np.load(fname)
+        E_nuc = basis_data["E_nuc"]
+        S = basis_data["overlap"]
+        T = basis_data["kinetic"]
+        V1 = basis_data["one_electron_potential"]
+        V2 = basis_data["two_electron_repulsion"]
+
+        cmo = basis_data["CMO"]
+
+        super().__init__(E_nuc, S, T, V1, V2, cmo, n_core, K_info, reorder)
+
+
+class pyscf_wrapper(gaussian_basis):
+    def __init__(self, mol, cmo, n_core):
+        super().__init__(
+            E_nuc=mol.energy_nuc(),
+            S=mol.intor("int1e_ovlp"),
+            T=mol.intor("int1e_kin"),
+            V1=mol.intor("int1e_nuc"),
+            V2=mol.intor("int2e"),
+            cmo=cmo,
+            n_core=n_core,
+        )
+
+
+def pyscf_get_hamiltonian_uhf(mol, cmo, n_core):
+    n_ao = cmo[0].shape[0]
+    n_mo = cmo[0].shape[1]
+    E_nuc = mol.energy_nuc()
+    T = mol.intor("int1e_kin")
+    V1 = mol.intor("int1e_nuc")
+    V2 = mol.intor("int2e")
+    H1 = T + V1
+
+    int1e = np.asarray([cmo[0].T @ (H1 @ cmo[0]), cmo[1].T @ (H1 @ cmo[1])])
+    pqkl_a = np.einsum(
+        "pqrl,rk->pqkl",
+        np.einsum("pqrs,sl->pqrl", V2, cmo[0], optimize=True),
+        cmo[0],
+        optimize=True,
+    )
+    pqkl_b = np.einsum(
+        "pqrl,rk->pqkl",
+        np.einsum("pqrs,sl->pqrl", V2, cmo[1], optimize=True),
+        cmo[1],
+        optimize=True,
+    )
+    ijkl_aa = np.einsum(
+        "pjkl,pi->ijkl",
+        np.einsum("pqkl,qj->pjkl", pqkl_a, cmo[0], optimize=True),
+        cmo[0],
+        optimize=True,
+    )
+    ijkl_bb = np.einsum(
+        "pjkl,pi->ijkl",
+        np.einsum("pqkl,qj->pjkl", pqkl_b, cmo[1], optimize=True),
+        cmo[1],
+        optimize=True,
+    )
+    ijkl_ab = np.einsum(
+        "pjkl,pi->ijkl",
+        np.einsum("pqkl,qj->pjkl", pqkl_b, cmo[0], optimize=True),
+        cmo[0],
+        optimize=True,
+    )
+    int2e = np.asarray(
+        [
+            ijkl_aa.transpose(0, 2, 1, 3),  # <-- Physisists' order
+            ijkl_bb.transpose(0, 2, 1, 3),  # <-- Physisists' order
+            ijkl_ab.transpose(0, 2, 1, 3),
+        ]
+    )  # <-- Physisists' order
+
+    # n_hole = Rcc.nocc
+    # n_act = n_mo - n_core
+    # n_part = n_act - n_hole
+    # print(n_core, n_hole, n_part, n_act, n_mo)
+
+    E_core, int1e, int2e = get_core_uhf(n_core, int1e, int2e)
+    # E_act = 2*np.einsum('ii',int1e[:n_hole,:n_hole]) \
+    #     + 2*np.einsum('ijij',int2e[:n_hole,:n_hole,:n_hole,:n_hole]) \
+    #       - np.einsum('ijji',int2e[:n_hole,:n_hole,:n_hole,:n_hole])
+    # print(E_nuc, E_core, E_act, E_nuc+E_core+E_act)
+    return (E_nuc, E_core, int1e, int2e)
+
+
+
+def get_integrals_rhf(mol, n_core, n_act, n_elec_total, ret_mf=False):
+    """
+    Input:
+    mol: pyscf mol object
+    n_core : number of core spatial orbitals
+    n_orb: number of active spatial orbitals
+    n_elec_total: number of active electrons (sum of alpha and beta spin electrons)
+    
+    Returns:
+        e_core (float): nuclear + core energy
+        h1eff (ndarray): effective 1e matrix (n_act,)*2
+        h2_phys (ndarray): 2e matrix in physisists' notation (n_act,)*4
+    """
+    #print(f"\n==================================================")
+    #print(f" STARTING RHF INTEGRALS PREPARATION ")
+    #print(f"==================================================")
+    
+    # 1. RHF
+    #print("\n[Step 1] Running RHF...")
+    t0 = time.time()
+    mf = scf.RHF(mol)
+    mf.verbose = 0
+    mf.run()
+    #print(f"  --> RHF Total Energy: {mf.e_tot:.10f} Hartree (Time: {time.time()-t0:.2f} sec)")
+    print(f"RHF Total Energy: {mf.e_tot:.10f} Hartree (Time: {time.time()-t0:.2f} sec)")
+    
+    # 2. Integrals
+    #print("\n[Step 2] Extracting MO Integrals...")
+    t0 = time.time()
+    mc = mcscf.CASCI(mf, ncas=n_act, nelecas=n_elec_total, ncore=n_core)
+    mc.verbose = 0
+    h1eff, e_core = mc.get_h1eff()
+    h2eff_compact = mc.get_h2eff()
+    
+    # Retriev chemists' format (pq|rs) = \int p(1)q(1) (1/r12) r(2)s(2)
+    h2_chemist = ao2mo.restore(1, h2eff_compact, n_act)
+    
+    # Transform to physisists' <pr|qs> = (pq|rs)
+    h2_phys = h2_chemist.transpose(0, 2, 1, 3)
+    #print(f"  --> Done (Time: {time.time()-t0:.2f} sec)")
+    print(f"Integral transformation completed (Time: {time.time()-t0:.2f} sec)")
+
+    if ret_mf:
+        return e_core, h1eff, h2_phys, mf
+    else:
+        return e_core, h1eff, h2_phys
+
+
+
+def get_integrals_rhf_PBC(enuc, madel, h1e, eri):
+    '''
+    Load Naoki's integral files and transform them into following forms
+    int1e[Nb, Nk, Nb, Nk]
+    int2e[Nb, Nk, Nb, Nk, Nb, Nk, Nb, Nk], 
+    where Nb and Nk are number of bands and k-points, respectively, then flatten to 
+    int1e[No, No]
+    int2e[No, No, No, No], 
+    where No = Nb*Nk.
+    E_const is the sum of nuclear repulsion and Madelung energies
+    '''
+    E_const = enuc - madel
+    
+    Nk = h1e.shape[0]
+    Nb = h1e.shape[1]
+    No = Nk * Nb
+    int1e = np.zeros((Nb,Nk,Nb,Nk), dtype=np.complex128)
+    for k in range(Nk):
+        for b in range(Nb):
+            for c in range(Nb):
+                int1e[b,k,c,k] = h1e[k,b,c] ### <-- Look here
+    int1e = int1e/Nk
+    int1e = int1e.reshape(No, No)
+
+    int2e = np.zeros((Nb,Nk,Nb,Nk,Nb,Nk,Nb,Nk), dtype=np.complex128)
+    for key, val in eri.items():
+        k0,k1,k2,k3 = key                 ### <-- Look here
+        int2e[:,k0,:,k1,:,k2,:,k3] = val  ### <-- Look here
+    int2e = int2e/Nk**2
+    int2e = int2e.reshape(No, No, No, No)
+
+    return E_const, int1e, int2e
+
+
+
+def get_ci_mask(norb, nelec, rank):
+    """
+    Generates a boolean mask matching the shape of an FCI vector.
+    True elements correspond to the HF reference, Singles,
+    and Doubles configurations.
+    """
+    if isinstance(nelec, (int, np.integer)):
+        nelec_a = nelec_b = nelec // 2
+    else:
+        nelec_a, nelec_b = nelec
+
+    # Get standard PySCF string listings for alpha and beta determinants
+    # Strings are represented as bitmasks where 1 indicates occupied
+    strings_a = fci.cistring.make_strings(range(norb), nelec_a)
+    strings_b = fci.cistring.make_strings(range(norb), nelec_b)
+
+    # Define the Hartree-Fock reference determinant bitmask
+    hf_mask_a = (1 << nelec_a) - 1
+    hf_mask_b = (1 << nelec_b) - 1
+
+    # Calculate excitation level by counting the bits that differ
+    # from the HF reference
+    # Excitation = (Number of bits different) / 2
+    ex_a = np.array([bin(s ^ hf_mask_a).count('1') // 2 for s in strings_a])
+    ex_b = np.array([bin(s ^ hf_mask_b).count('1') // 2 for s in strings_b])
+
+    # Combine alpha and beta excitations to find the total excitation level
+    total_ex = ex_a[:, None] + ex_b[None, :]
+    
+    # Keep only configurations where the total excitation level is <= rank
+    return total_ex <= rank
+
+def get_cis_mask(norb, nelec):
+    return get_ci_mask(norb, nelec, rank=1)
+
+
+def get_cisd_mask(norb, nelec):
+    return get_ci_mask(norb, nelec, rank=2)
+
+def get_cisdt_mask(norb, nelec):
+    return get_ci_mask(norb, nelec, rank=3)
+
+
+def sigma_restricted_fullci_mask(h1eff, h2_phys, cvec, norb, nelec, mask=None):
+    
+    n_str = int(math.comb(norb, nelec // 2))
+    cvec_2d = cvec.reshape(n_str, n_str)
+    if mask is not None:
+        cvec_2d = np.where(mask, cvec_2d, 0.0)
+    
+    h2_chemist = np.array(h2_phys.transpose(0,2,1,3), dtype=np.float64)
+    h2_pyscf_packed = ao2mo.restore(4, h2_chemist, norb)
+    
+    cisolver = fci.direct_spin1.FCI()
+    
+    eri_packed = fci.direct_spin1.absorb_h1e(h1eff, h2_chemist, norb, nelec, fac=0.5)
+    sigma_2d = fci.direct_spin1.contract_2e(eri_packed, cvec_2d, norb, nelec)
+    if mask is not None:
+        sigma_2d = np.where(mask, sigma_2d, 0.0)
+
+    sigma = sigma_2d.ravel()
+
+    return sigma
+
+def davidson_restricted_fullci_mask(
+        h1eff, h2_phys, norb, nelec, mask = None,
+        nroots = 1,
+        max_cycle = 100,
+        conv_tol = 1e-14):
+    """
+    Run a custom Davidson diagonalization    
+    Inputs:
+        h1eff (ndarray): 1e integrals, shape (norb, norb)
+        h2_phys (ndarray): 2e integrals in physicists' notation, shape (norb, norb, norb, norb)
+        norb (int): Number of active spatial orbitals
+        nelec (int): Total number of active electrons
+        mask (ndarray): Boolean mask of shape (n_str, n_str) for CI subspace selection
+        max_cycle (int): Maximum Davidson iterations
+        conv_tol (float): Convergence tolerance for the residual norm
+        
+    Returns:
+        energies (ndarray): The lowest eigenvalues (CI energy offset from e_core)
+        civec (ndarray): The converged CI wave function (array of flat 1D array)
+    """
+    n_str = int(math.comb(norb, nelec // 2))
+    tot_dim = n_str * n_str
+
+    # ==========================================================================
+    # 1. Define the Matrix-Vector Product (Hop) Function required by Davidson
+    # ==========================================================================
+    def hop_matrix_vector(x):
+        """
+        Takes a 1D vector 'x', applies the masked Hamiltonian, and returns 1D Sigma.
+        This is a direct wrapper around your 'get_sigma_pyscf' logic.
+        """
+        # x comes in as a 1D array from the Davidson solver
+        return sigma_restricted_fullci_mask(
+            h1eff, h2_phys, x, norb, nelec, mask=mask
+        )
+
+
+    # ==========================================================================
+    # 2. Prepare the Preconditioner (Diagonal of the Hamiltonian)
+    # ==========================================================================
+    # Davidson requires a diagonal approximation (hdiag) to construct the residual steps.
+    # We use PySCF's standard direct_spin1.make_hdiag and mask it to match the CISD space.
+    h2_chemist = np.array(h2_phys.transpose(0, 2, 1, 3), dtype=np.float64)
+    hdiag_raw = fci.direct_spin1.make_hdiag(h1eff, h2_chemist, norb, nelec)
+    hdiag_2d = hdiag_raw.reshape(n_str, n_str)
+    
+    # Force out-of-subspace diagonal elements to a large value (e.g., 1e4) 
+    # to prevent the preconditioner from picking them up during residual updates.
+    hdiag_2d_projected = np.where(mask, hdiag_2d, 1e4)
+    hdiag = hdiag_2d_projected.ravel()
+
+    # ==========================================================================
+    # 3. Generate a Guess Vector strictly within the Subspace given by mask
+    # ==========================================================================
+    # Start with a simple Hartree-Fock guess (1.0 at index 0, or just random masked)
+    guess_vector = np.zeros(tot_dim)
+    guess_vector[0] = 1.0 
+    
+    # Double check guess vector constraint
+    guess_vector = np.where(mask.ravel(), guess_vector, 0.0)
+    guess_vector /= np.linalg.norm(guess_vector)
+
+    # ==========================================================================
+    # 4. Execute PySCF's Core Davidson Diagonalization
+    # ==========================================================================
+    #print("\n[Davidson Solver] Initializing custom Davidson diagonalization...")
+    
+    # lib.davidson expects: (hop_function, guess_vectors, preconditioner_diagonal)
+    # nroots=1 means we are targeting the lowest state (ground state).
+    eigenvalues, eigenvectors = lib.davidson(
+        hop_matrix_vector, 
+        [guess_vector], 
+        hdiag, 
+        tol=conv_tol, 
+        max_cycle=max_cycle,
+        nroots=1,
+        verbose=5
+    )
+
+    return eigenvalues, eigenvectors
+
+
+
+def benchmark_rhf(mol,
+                  norb = None,
+                  nelec = None,
+                  cisd = False,
+                  full_ci = False,
+                  active_space_ci = False,
+                  active_space_ci_mask = None):    
+    """
+    Input:
+    mol: pyscf mol object
+    norb: number of spatial orbitals
+    nelec: number of electrons (sum of alpha and beta spin electrons)
+    cisd: bool, if True, performs CISD benchmark
+    full_ci: bool, if True, performs FCI benchmark
+    active_space_ci: bool, if True, performs active-space CI benchmark
+    
+    Returns:
+    energy
+    civetor
+    """
+    
+    print(f"\n======================")
+    print(f" STARTING BENCHMARK")
+    print(f"=======================")
+
+    # 1. RHF
+    print("\n[Step 1] Running RHF...")
+    t0 = time.time()
+    mf = scf.RHF(mol)
+    mf.verbose = 0
+    mf.run()
+    print(f"  --> RHF Total Energy: {mf.e_tot:.10f} Hartree (Time: {time.time()-t0:.2f} sec)")
+    
+    # 2. (1) PySCF CISD solver
+    if cisd:
+        print("\n[Step 2] Running PySCF CISD Benchmark...")
+        myci = ci.CISD(mf)
+        myci.verbose = 0
+        myci.conv_tol = 1e-14
+        myci.max_cycle = 100
+        
+        t_cisd_start = time.time()
+        e_corr, civec_pyscf = myci.kernel()
+        t_cisd_end = time.time()
+
+        total_cisd_energy = mf.e_tot + e_corr
+        
+        # Unpack flat vector to check internal dimensions
+        c0, c1, c2 = myci.cisdvec_to_amplitudes(civec_pyscf)
+        cisd_dim = civec_pyscf.size
+
+        print(f"  --> CISD Dimension:    {cisd_dim:,} (c0: {c0.size}, c1: {c1.size}, c2: {c2.size})")
+        print(f"  --> CISD Solver Time:  {t_cisd_end - t_cisd_start:.4f} sec")
+        print(f"  --> CISD Total Energy: {total_cisd_energy:.10f} Hartree")
+        print(f"==================================================\n")
+
+        return total_cisd_energy, civec_pyscf
+    
+    # 2. (2) Use PySCF built-in CASCI framework for integral extraction
+    print("\n[Step 2] Running Built-in CASCI for Setup...")
+    t0 = time.time()
+    mc = mcscf.CASCI(mf, norb, nelec)
+    #mc.verbose = 0
+    #mc.kernel()
+    #print(f"  --> CASCI Total Energy: {mc.e_tot:.10f} Hartree (Time: {time.time()-t0:.2f} sec)")
+
+    # 3. Integrals
+    print("\n[Step 3] Extracting MO Integrals...")
+    h1eff, e_core = mc.get_h1eff()
+    h2eff_compact = mc.get_h2eff()
+    
+    # Retrieve chemists' format (pq|rs) = \int p(1)q(1) (1/r12) r(2)s(2)
+    h2_chemist = ao2mo.restore(1, h2eff_compact, norb)
+    
+    # Transform to physicists' <pr|qs> = (pq|rs)
+    h2_phys = h2_chemist.transpose(0, 2, 1, 3)
+
+    # 4-1. PySCF FCI solver
+    if full_ci:
+        print("\n[Step 4] Running PySCF FCI Benchmark (Target to Beat!)...")
+        cisolver = fci.direct_spin1.FCI()
+
+        # =========================================================
+        cisolver.conv_tol = 1e-14   # convergence threshold
+        cisolver.lindep = 1e-16     # linear dependence threshold
+        cisolver.max_cycle = 100    # maximum iteration
+        # =========================================================
+        
+        # Timing for FCI computation
+        t_fci_start = time.time()
+        e_fci, civec_pyscf = cisolver.kernel(h1eff, h2_chemist, norb, nelec)
+        t_fci_end = time.time()
+
+        total_fci_energy = e_fci + e_core
+        fci_dim = civec_pyscf.size
+
+        print(f"  --> FCI Dimension:    {fci_dim:,}")
+        print(f"  --> FCI Solver Time:  {t_fci_end - t_fci_start:.4f} sec")
+        print(f"  --> FCI Total Energy: {total_fci_energy:.10f} Hartree")
+        #print(f"  --> Consistency Check: {abs(total_fci_energy - mc.e_tot):.2e} (Should be ~0)")
+        print(f"==================================================\n")
+
+        return total_fci_energy, civec_pyscf
+
+    # 4-2. PySCF Active-space masked FCI solver
+    elif active_space_ci:
+        print("\n[Step 4] Running PySCF Active-Space CI Benchmark...")
+        
+        # Generate the excitation mask mapping the subspace
+        mask = active_space_ci_mask
+        aci_dim = np.sum(mask)
+
+        # Run the Davidson diagonalization under the projection constraint
+        t_aci_start = time.time()
+        
+        e_aci, civec_pyscf = davidson_restricted_fullci_mask(
+            h1eff, h2_phys, norb, nelec, 
+            mask, max_cycle=100, conv_tol=1e-14)
+        #e_aci = e_aci[0]
+        #civec_pyscf = civec_pyscf[:,0]
+        t_aci_end = time.time()
+
+        total_aci_energy = e_aci + e_core
+        print(f"  --> Active CI Dimension: {aci_dim:,} / {civec_pyscf.size:,}")
+        print(f"  --> Active CI Time:      {t_aci_end - t_aci_start:.4f} sec")
+        print(f"  --> Active CI Energy:    {total_aci_energy:.10f} Hartree")
+        print(f"==================================================\n")
+
+        return total_aci_energy, civec_pyscf

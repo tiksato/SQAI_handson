@@ -1,0 +1,8 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "misc_utils"
+version = "0.0.1"
+dependencies = ["scipy"]

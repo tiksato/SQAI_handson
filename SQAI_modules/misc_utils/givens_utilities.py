@@ -1,0 +1,337 @@
+import numpy as np
+from mpmath import mp, mpf
+
+def svd_mp(array2d):
+    
+    mat = mp.matrix(array2d)
+    U, Z, VT = mp.svd(mat)
+
+    Z = np.array(Z)
+    U = np.array(U).reshape(U.rows, U.cols)
+    VT = np.array(VT).reshape(VT.rows, VT.cols)
+
+    return U, Z, VT
+
+def abs_mp(x):
+    
+    if isinstance(x, np.ndarray):
+        absx = np.array([mp.fabs(a) for a in x])
+    else:
+        absx = mp.fabs(x)
+        
+    return absx
+
+def zeros_mp(shape):
+
+    if hasattr(shape, "__iter__"):
+        lenx = 1
+        for n in shape:
+            lenx *= n
+    else:
+        lenx = shape
+
+    return np.array([mpf('0')]*lenx).reshape(shape)
+
+    
+class Givens_tools():
+    def __init__(self, use_mp = False, mp_dps = 100):
+
+        self.setup(use_mp, mp_dps)
+
+    def setup(self, use_mp = False, mp_dps = 100):
+        
+        self.use_mp = use_mp
+        self.mp_dps = mp_dps
+        mp.dps = mp_dps
+
+        if not self.use_mp:
+            self._cos = np.cos
+            self._sin = np.sin
+            self._atan2 = np.arctan2
+            self._abs = np.abs
+            self._zeros = np.zeros
+            self._norm = np.linalg.norm
+            self._svd = np.linalg.svd
+
+            self._argmax = np.argmax
+            self._sign = np.sign
+
+            self._zero = 0.0
+            self._one = 1.0
+            self._pi = np.pi
+        else:
+            self._cos = mp.cos
+            self._sin = mp.sin
+            self._atan2 = mp.atan2
+            self._abs = abs_mp
+            self._zeros = zeros_mp
+            self._norm = lambda data: mp.norm(data.flatten())
+            #self._norm = np.linalg.norm
+            self._svd = svd_mp
+
+            self._argmax = lambda data: np.argmax([float(x) for x in data])
+            self._sign = mp.sign
+
+            self._zero = mpf('0')
+            self._one = mpf('1')
+            self._pi = mp.pi
+            
+            
+    def left_multiply_Givens(self, mat, i_row, j_row, theta):
+        '''
+        multiply the Givens matrix from the left (i < j):
+                i     j
+          1 . . 0 . . 0 . . 0 
+          0 1               .
+          .   .             .
+        i 0 . . c . .-s . . 0
+          .       .         .
+          .         .       .
+        j 0 . . s . . c . . 0
+          .             .   .
+          .               1 .
+          0 . . 0 . . 0 . . 1
+        '''
+
+        n_row = mat.shape[0]
+        n_col = mat.shape[1]
+        c = self._cos(theta)
+        s = self._sin(theta)
+        mat_rot = mat.copy()
+        mat_rot[i_row,:] = c*mat[i_row,:] - s*mat[j_row,:]
+        mat_rot[j_row,:] = s*mat[i_row,:] + c*mat[j_row,:]
+        
+        return mat_rot
+
+    def polar_angles_on_a_unit_hypersphere(self, vec, small_np=1E-14, small_mp='1E-15'):
+        '''
+        vec[0]   = sin(t_N-1) sin(t_N-2) ... sin(t_2) sin(t_1)
+        vec[1]   = sin(t_N-1) sin(t_N-2) ... sin(t_2) cos(t_1)
+        vec[2]   = sin(t_N-1) sin(t_N-2) ... cos(t_2)
+        ...
+        vec[N-2] = sin(t_N-1) cos(t_N-2)
+        vec[N-1] = cos(t_N-1)
+
+        tan(t_1)   = vec[0]/(vec[1] * 1)
+        tan(t_2)   = vec[1]/(vec[2] * cos(t_1))
+        tan(t_3)   = vec[2]/(vec[3] * cos(t_2))
+        ...
+        tan(t_N-2) = vec[N-3]/(vec[N-2] * cos(t_N-3))
+        tan(t_N-1) = vec[N-2]/(vec[N-1] * cos(t_N-2))
+        '''
+
+        if not self.use_mp:
+            small = small_np
+        else:
+            small = mpf(small_mp)
+        
+        if self._abs(self._one - self._norm(vec)) > small:
+            raise Exception(f"Unnormalized vector: norm = {self._abs(self._one - self._norm(vec))}")
+        
+        angles = np.array([self._zero]*(len(vec)-1))
+    
+        c_prev = self._one
+        for i_angle in range(len(angles)):
+            angles[i_angle] = self._atan2(vec[i_angle], c_prev*vec[i_angle+1])
+            c_prev = self._cos(angles[i_angle])
+
+        if self._abs(vec[-1] - self._cos(angles[-1])) > 1E-10:
+            angles[-1] += self._pi
+        if self._abs(vec[-1] - self._cos(angles[-1])) > 1E-10:
+            raise Exception("Algorithm failed.")
+
+        return angles
+
+    def solve_quasi_linear_system(self, coeff_mat, rhs_vec, small_np=1E-14, small_mp='1E-15'):
+        '''
+        Solve
+        sin(t) M x = cos(t) b, 
+        where t is an angle and x is a normalized vector.
+    
+        input: 
+        coeff_mat: M, (N,N) ndarray
+        rhs_vec: b, (N,) ndarray
+    
+        return:
+        theta: t, float
+        xvec: x, (N,) ndarray
+        '''
+
+        if not self.use_mp:
+            small = small_np
+        else:
+            small = mpf(small_mp)
+
+        #print("coeff_mat:")
+        #print(coeff_mat)
+        #print("rhs_vec:")
+        #print(rhs_vec)
+
+    
+        U, Z, VT = self._svd(coeff_mat)
+
+        if self._abs(Z[-1]) > small:
+        
+            xvec = VT.T @ ((U.T @ rhs_vec) / Z)
+            xnorm = self._norm(xvec)
+            arg_max = self._argmax(self._abs(xvec))
+            xsign = self._sign(xvec[arg_max])
+            xunit = xsign*(xvec/xnorm)
+
+            theta = self._atan2(xunit @ xvec, 1)
+            xvec = xunit
+            #xvec = xvec/np.tan(theta)
+
+        else:
+        
+            yvec = self._zeros_like(rhs_vec)
+            for i, Z_i in enumerate(Z):
+                if self._abs(Z_i) < small:
+                    yvec[i] = 1.0
+            yvec = yvec / self._norm(yvec)
+            xvec = VT.T @ yvec
+            theta = 0.5 * self._pi
+
+        return xvec, theta
+
+    def get_angle_to_delete_an_element(self, mat, i_row, j_row, k_col):
+        '''
+        delete an element * by a Givens rotation (i < j):
+                    k        
+          . . . . . . . . . .
+          .                 .
+        i . . . . . . . . . .
+          .                 .
+        j . . . . . * . . . .
+          .                 .
+          . . . . . . . . . .
+        '''    
+        theta = self._atan2(-mat[j_row, k_col], mat[i_row, k_col])        
+        return theta
+
+    def get_angles_to_delete_elements(self, mat, rows, cols, adjacent = True):
+        '''
+        Delete an element * by 
+        (i) Givens rotations among x's and * (adjacent = True) or
+        (ii) Givens between x's and * (adjacent = False)
+        len(rows) should be len(cols) + 1.
+        Example: rows = (1,3,4,6,7), cols = (1,2,4,7).
+            1 2   3     4
+          . . . . . . . . . . 
+        0 . x x   x     x   . 
+          . . . . . . . . . .     
+        1 . x x . x . . x . . 
+        2 . x x . x . . x . .
+          . . . . . . . . . .
+        3 . x x . x . . x . . 
+        4 . * * . * . . * . .
+          . . . . . . . . . .     
+        '''    
+        if adjacent:
+            coeff_mat = mat[rows[:-1],:][:,cols]
+            coeff_mat = coeff_mat.T
+            rhs_vec = -mat[rows[-1], cols]
+        else:
+            tmp = mat[rows,:][:,cols]
+            coeff_mat = tmp[[-1]+[j for j in range(len(rows)-2)],:]
+            coeff_mat = coeff_mat.T
+            rhs_vec = -tmp[-2,:]
+
+        angles = self._zeros(len(cols))
+        xvec, angles[-1] = self.solve_quasi_linear_system(coeff_mat, rhs_vec)
+        if len(cols) >= 2:
+            angles[:-1] = self.polar_angles_on_a_unit_hypersphere(xvec)
+
+        if not adjacent:
+            angles = 0.5*np.pi - angles
+    
+        return angles
+
+    def QR_Givens(self, mat: np.ndarray):
+        '''
+        QR decompose a matrix of length (N,M) by (N(N-1))/2 adjacent Givens rotations,
+        with elements eliminated in the following order (N = 6, e.g):
+        *
+        5  *
+        4  9  *
+        3  8 12  *
+        2  7 11 14  *
+        1  6 10 13 15  *
+        '''
+        n_row = mat.shape[0]
+        n_col = mat.shape[1]
+        mat_rot = mat.copy()
+        rows_list = []
+        theta_list = []
+        for k_col in range(n_col-1):
+            for i_row in range(n_row-1, k_col, -1):
+                rows_list.append((i_row-1, i_row))
+                theta_list.append(self.get_angle_to_delete_an_element(mat_rot, i_row-1, i_row, k_col))
+                mat_rot = self.left_multiply_Givens(mat_rot, i_row-1, i_row, theta_list[-1])
+        return rows_list, theta_list, mat_rot
+
+    def QR_Givens2(self, mat: np.ndarray, No: int):
+        '''
+        Eliminates No * Nv lower-left elements of a matrix
+        by No * Nv adjacent Givens rotations. Example for No = Nv = 3:
+        *
+        *  *
+        *  *  *
+        3  3  3  *
+        2  2  2  *  *
+        1  1  1  *  *  *
+        '''
+        N = mat.shape[0]
+        Nv = N - No
+
+        cols = [i for i in range(No)]
+    
+        mat_rot = mat.copy()
+        rows_list = []
+        theta_list = []
+
+        for row_ll in range(N-No-1,-1,-1):
+            row_ul = row_ll + No
+            rows = [i for i in range(row_ll, row_ul+1)]
+            #print("#####", mat_rot.shape, rows, cols)
+            angles = self.get_angles_to_delete_elements(mat_rot, rows, cols)
+
+            for i_row, theta in enumerate(angles):
+                theta_list.append(theta)
+                rows_list.append((rows[i_row], rows[i_row+1]))
+                mat_rot = self.left_multiply_Givens(mat_rot, rows[i_row], rows[i_row+1], theta)
+            
+        return rows_list, theta_list, mat_rot
+
+    def QR_Givens3(self, mat: np.ndarray, No: int):
+        '''
+        Eliminates No * Nv lower-left elements of a matrix
+        by No * Nv occ-vir Givens rotations. Example for No = Nv = 3:
+        *
+        *  *
+        *  *  *
+        3  3  3  *
+        2  2  2  *  *
+        1  1  1  *  *  *
+        '''
+        N = mat.shape[0]
+        Nv = N - No
+
+        cols = [i for i in range(No)]
+    
+        mat_rot = mat.copy()
+        rows_list = []
+        theta_list = []
+
+        for row_to_delete in range(N-1,No-1,-1):
+            rows = [i for i in range(No)] + [row_to_delete]
+            #print("#####", mat_rot.shape, rows, cols)
+            angles = self.get_angles_to_delete_elements(
+                mat_rot, rows, cols, adjacent = False)
+
+            for i_row, theta in enumerate(angles):
+                theta_list.append(theta)
+                rows_list.append((rows[i_row], rows[-1]))
+                mat_rot = self.left_multiply_Givens(mat_rot, rows[i_row], rows[-1], theta)
+            
+        return rows_list, theta_list, mat_rot
